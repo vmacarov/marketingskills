@@ -118,4 +118,10 @@ Use country code: `us`, `uk`, `de`, `fr`, `ca`, `au`, etc.
 - seo-audit
 - programmatic-seo
 - content-strategy
-- competitor-alternatives
+- competitors
+
+### CLI CSV decoding
+
+The [Semrush CLI](../clis/semrush.js) requests `export_escape=1` and decodes the
+semicolon-separated report into JSON objects. Quoted headers/cells, escaped
+quotes, and line breaks inside cells are preserved as field values.

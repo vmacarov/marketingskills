@@ -11,19 +11,23 @@ const path = require("path");
 
 const SKILLS_DIR = "skills";
 const MARKETPLACE_FILE = ".claude-plugin/marketplace.json";
+const PLUGIN_FILE = ".claude-plugin/plugin.json";
+const CODEX_PLUGIN_FILE = ".codex-plugin/plugin.json";
 const README_FILE = "README.md";
 
 /**
  * Parse YAML frontmatter from a SKILL.md file
  */
 function parseFrontmatter(content) {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
+  const match = content.replace(/\r\n/g, "\n").match(/^---\n([\s\S]*?)\n---/);
   if (!match) return {};
 
   const frontmatter = {};
   const lines = match[1].split("\n");
 
   for (const line of lines) {
+    // Nested metadata keys are not skill name/description fields.
+    if (/^\s/.test(line)) continue;
     const colonIndex = line.indexOf(":");
     if (colonIndex === -1) continue;
 
@@ -113,7 +117,7 @@ function updateReadme(skills) {
   const content = fs.readFileSync(README_FILE, "utf8");
 
   // Match content between skill list markers
-  const tableRegex = /(<!-- SKILLS:START -->\n)[\s\S]*?(\n<!-- SKILLS:END -->)/;
+  const tableRegex = /(<!-- SKILLS:START -->\r?\n)[\s\S]*?(\r?\n<!-- SKILLS:END -->)/;
   const newTable = generateSkillsTable(skills);
 
   if (!tableRegex.test(content)) {
@@ -121,7 +125,10 @@ function updateReadme(skills) {
     return false;
   }
 
-  const newContent = content.replace(tableRegex, `$1${newTable}$2`);
+  const newContent = content.replace(tableRegex, (_match, start, end) => {
+    const newline = start.endsWith("\r\n") ? "\r\n" : "\n";
+    return start + newTable.replaceAll("\n", newline) + end;
+  });
 
   if (newContent === content) {
     return false;
@@ -132,27 +139,51 @@ function updateReadme(skills) {
 }
 
 /**
- * Update marketplace.json with skills list
+ * Update marketplace.json — refresh the skill count in the plugin description
+ * and strip any `skills` array if present. Claude Code's plugin schema discovers
+ * skills via the `skills/` directory; the explicit array fails validation, so
+ * this script must never (re-)introduce it.
  */
 function updateMarketplace(skills) {
   const marketplace = JSON.parse(fs.readFileSync(MARKETPLACE_FILE, "utf8"));
   const plugin = marketplace.plugins[0];
-  const existingSkills = plugin.skills || [];
-  const currentSkills = skills.map((s) => s.path);
 
-  if (JSON.stringify(currentSkills) === JSON.stringify(existingSkills)) {
+  const oldDescription = plugin.description;
+  const newDescription = updateSkillCount(plugin.description, skills.length);
+  const hadStaleSkillsArray = "skills" in plugin;
+
+  if (newDescription === oldDescription && !hadStaleSkillsArray) {
     return { updated: false };
   }
 
-  plugin.skills = currentSkills;
-  plugin.description = updateSkillCount(plugin.description, currentSkills.length);
+  plugin.description = newDescription;
+  delete plugin.skills;
 
   fs.writeFileSync(MARKETPLACE_FILE, JSON.stringify(marketplace, null, 2) + "\n");
 
-  const added = currentSkills.filter((s) => !existingSkills.includes(s));
-  const removed = existingSkills.filter((s) => !currentSkills.includes(s));
+  return { updated: true, removedSkillsArray: hadStaleSkillsArray };
+}
 
-  return { updated: true, added, removed };
+/**
+ * Update plugin.json's `version` field to match marketplace.json's
+ * `metadata.version`. Claude Code uses plugin.json's version for the update
+ * check (`claude plugin update`); if it drifts from marketplace.json the
+ * update path silently breaks.
+ */
+function updatePluginVersion(file = PLUGIN_FILE) {
+  if (!fs.existsSync(file)) return { updated: false };
+
+  const marketplace = JSON.parse(fs.readFileSync(MARKETPLACE_FILE, "utf8"));
+  const plugin = JSON.parse(fs.readFileSync(file, "utf8"));
+  const marketplaceVersion = marketplace.metadata && marketplace.metadata.version;
+
+  if (!marketplaceVersion) return { updated: false };
+  if (plugin.version === marketplaceVersion) return { updated: false };
+
+  const oldVersion = plugin.version;
+  plugin.version = marketplaceVersion;
+  fs.writeFileSync(file, JSON.stringify(plugin, null, 2) + "\n");
+  return { updated: true, oldVersion, newVersion: marketplaceVersion };
 }
 
 function main() {
@@ -160,20 +191,27 @@ function main() {
 
   const marketplaceResult = updateMarketplace(skills);
   const readmeUpdated = updateReadme(skills);
+  const pluginResult = updatePluginVersion();
+  const codexResult = updatePluginVersion(CODEX_PLUGIN_FILE);
 
-  if (!marketplaceResult.updated && !readmeUpdated) {
+  if (!marketplaceResult.updated && !readmeUpdated && !pluginResult.updated && !codexResult.updated) {
     console.log("Everything is already in sync");
     return;
   }
 
   if (marketplaceResult.updated) {
-    if (marketplaceResult.added.length) {
-      console.log(`Added: ${marketplaceResult.added.join(", ")}`);
-    }
-    if (marketplaceResult.removed.length) {
-      console.log(`Removed: ${marketplaceResult.removed.join(", ")}`);
+    if (marketplaceResult.removedSkillsArray) {
+      console.log("Stripped stale `skills` array from marketplace.json");
     }
     console.log(`Updated marketplace.json (${skills.length} skills)`);
+  }
+
+  if (pluginResult.updated) {
+    console.log(`Bumped plugin.json version: ${pluginResult.oldVersion} → ${pluginResult.newVersion}`);
+  }
+
+  if (codexResult.updated) {
+    console.log(`Bumped .codex-plugin/plugin.json version: ${codexResult.oldVersion} → ${codexResult.newVersion}`);
   }
 
   if (readmeUpdated) {
